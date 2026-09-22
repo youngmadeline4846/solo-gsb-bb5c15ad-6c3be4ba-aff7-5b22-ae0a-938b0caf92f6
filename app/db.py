@@ -39,6 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_policy_rules_policy ON policy_rules(policy_id);
 CREATE TABLE IF NOT EXISTS fragments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id   TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    fragment_id   INTEGER NOT NULL,          -- 响应内唯一：按合并后原始顺序从 1 起
+    decision_rank INTEGER NOT NULL,          -- 优先级排序后的决策次序（从 1 起）
+    blocked_by_fragment_id INTEGER,          -- 丢弃片段指向实际阻断者；保留片段为 NULL
     placeholder   TEXT NOT NULL,
     category      TEXT NOT NULL,
     start_offset  INTEGER NOT NULL,
@@ -77,6 +80,26 @@ _MIGRATIONS = (
     " ON fragments(document_id, placeholder, start_offset) WHERE kept = 1",
 )
 
+# 片段冲突溯源字段迁移（fragment_id / decision_rank / blocked_by_fragment_id）
+_TRACE_MIGRATIONS = (
+    "ALTER TABLE fragments ADD COLUMN fragment_id INTEGER",
+    "ALTER TABLE fragments ADD COLUMN decision_rank INTEGER",
+    "ALTER TABLE fragments ADD COLUMN blocked_by_fragment_id INTEGER",
+    # 旧数据按插入顺序（id）落库，而提交时正是按合并后原始顺序写入 -> 直接据此回填
+    "UPDATE fragments SET fragment_id = ("
+    " SELECT COUNT(*) FROM fragments AS f"
+    " WHERE f.document_id = fragments.document_id AND f.id <= fragments.id"
+    ")",
+    # 旧库无法重建当时的决策次序，最佳近似为原始顺序；阻断关系无法回溯，保持 NULL
+    "UPDATE fragments SET decision_rank = fragment_id WHERE decision_rank IS NULL",
+)
+
+# fragment_id 列就绪后（新库或迁移后）再建唯一索引，保证持久化后编号不漂移
+_TRACE_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_fragments_fragment_id"
+    " ON fragments(document_id, fragment_id)"
+)
+
 
 async def init_db(db_path: str = ":memory:") -> None:
     """幂等建表 / 迁移（容器启动与 CLI 共用）。
@@ -86,6 +109,7 @@ async def init_db(db_path: str = ":memory:") -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(SCHEMA)
         await _migrate(db)
+        await db.execute(_TRACE_INDEX)
         await db.commit()
 
 
@@ -95,6 +119,7 @@ def init_db_sync(db_path: str) -> None:
     try:
         conn.executescript(SCHEMA)
         _migrate_sync(conn)
+        conn.execute(_TRACE_INDEX)
         conn.commit()
     finally:
         conn.close()
@@ -108,12 +133,18 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "rule_id" not in existing:
         for stmt in _MIGRATIONS:
             await db.execute(stmt)
+    if "fragment_id" not in existing:
+        for stmt in _TRACE_MIGRATIONS:
+            await db.execute(stmt)
 
 
 def _migrate_sync(conn: sqlite3.Connection) -> None:
     existing = {r[1] for r in conn.execute("PRAGMA table_info(fragments)")}
     if "rule_id" not in existing:
         for stmt in _MIGRATIONS:
+            conn.execute(stmt)
+    if "fragment_id" not in existing:
+        for stmt in _TRACE_MIGRATIONS:
             conn.execute(stmt)
 
 

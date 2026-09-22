@@ -44,6 +44,20 @@ class SubmitRequest(BaseModel):
 
 
 class FragmentOut(BaseModel):
+    fragment_id: int = Field(
+        ...,
+        ge=1,
+        description="响应内唯一编号，按合并后的原始顺序（人工 spans 在前、自动候选接其后）从 1 起分配；持久化后不漂移",
+    )
+    decision_rank: int = Field(
+        ...,
+        ge=1,
+        description="按优先级排序后依次落位的决策次序（从 1 起）",
+    )
+    blocked_by_fragment_id: int | None = Field(
+        None,
+        description="保留片段为 null；丢弃片段指向当时已落位且实际导致拒绝的首个片段的 fragment_id",
+    )
     placeholder: str
     category: str
     start: int

@@ -141,13 +141,17 @@ class DocumentService:
                 ),
             )
             await cur.executemany(
-                "INSERT INTO fragments (document_id, placeholder, category,"
+                "INSERT INTO fragments (document_id, fragment_id, decision_rank,"
+                " blocked_by_fragment_id, placeholder, category,"
                 " start_offset, end_offset, priority, kept, drop_reason, cipher_value,"
                 " source, rule_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         doc_id,
+                        sp.fragment_id,
+                        sp.decision_rank,
+                        sp.blocked_by_fragment_id,
                         sp.placeholder,
                         sp.category,
                         sp.start,
@@ -195,9 +199,10 @@ class DocumentService:
             raise ExpiredError("文档映射已过期")
 
         async with self.db.execute(
-            "SELECT placeholder, category, start_offset, end_offset, priority,"
+            "SELECT fragment_id, decision_rank, blocked_by_fragment_id,"
+            " placeholder, category, start_offset, end_offset, priority,"
             " kept, drop_reason, source, rule_id FROM fragments WHERE document_id = ?"
-            " ORDER BY start_offset",
+            " ORDER BY fragment_id",
             (document_id,),
         ) as cur:
             frags = await cur.fetchall()
@@ -330,6 +335,9 @@ class DocumentService:
     @staticmethod
     def _fragment_out(sp) -> FragmentOut:
         return FragmentOut(
+            fragment_id=sp.fragment_id,
+            decision_rank=sp.decision_rank,
+            blocked_by_fragment_id=sp.blocked_by_fragment_id,
             placeholder=sp.placeholder,
             category=sp.category,
             start=sp.start,
@@ -344,6 +352,9 @@ class DocumentService:
     @staticmethod
     def _row_out(row: aiosqlite.Row) -> FragmentOut:
         return FragmentOut(
+            fragment_id=row["fragment_id"],
+            decision_rank=row["decision_rank"],
+            blocked_by_fragment_id=row["blocked_by_fragment_id"],
             placeholder=row["placeholder"],
             category=row["category"],
             start=row["start_offset"],

@@ -98,7 +98,10 @@ python -m pytest -q
 - 自动片段同样使用 Unicode 码位偏移，与人工片段统一进入下面的确定性重叠排序；
 - 当 **优先级、起止位置、长度完全相同** 时，**人工片段优先**于自动片段；
 - 响应中每个片段带 `source`（`"manual"` 手传 / `"auto"` 规则生成）与 `rule_id`
-  （仅 `auto` 片段标注来源规则）。
+  （仅 `auto` 片段标注来源规则）；
+- 每个片段还带**冲突溯源**字段（详见第四节）：`fragment_id`（按合并后原始顺序
+  分配的响应内唯一编号）、`decision_rank`（优先级排序后的决策次序）、
+  `blocked_by_fragment_id`（丢弃片段实际被哪个已落位片段阻断）。
 
 响应（节选）：
 
@@ -107,13 +110,17 @@ python -m pytest -q
   "document_id": "0b0b3e4b…",
   "redacted_text": "甲方{{PERSON:01}}向乙方{{PERSON:02}}借款{{MONEY:01}}。",
   "fragments": [
-    {"placeholder": "{{PERSON:01}}", "category": "PERSON", "start": 2, "end": 4,
+    {"fragment_id": 1, "decision_rank": 1, "blocked_by_fragment_id": null,
+     "placeholder": "{{PERSON:01}}", "category": "PERSON", "start": 2, "end": 4,
      "priority": 5, "kept": true,  "drop_reason": null, "source": "manual", "rule_id": null},
-    {"placeholder": "{{PERSON:02}}", "category": "PERSON", "start": 7, "end": 9,
+    {"fragment_id": 2, "decision_rank": 2, "blocked_by_fragment_id": null,
+     "placeholder": "{{PERSON:02}}", "category": "PERSON", "start": 7, "end": 9,
      "priority": 5, "kept": true,  "drop_reason": null, "source": "auto", "rule_id": "person-name"},
-    {"placeholder": "{{MONEY:01}}",  "category": "MONEY",  "start": 11, "end": 20,
+    {"fragment_id": 3, "decision_rank": 3, "blocked_by_fragment_id": null,
+     "placeholder": "{{MONEY:01}}", "category": "MONEY", "start": 11, "end": 20,
      "priority": 3, "kept": true,  "drop_reason": null, "source": "auto", "rule_id": "money"},
-    {"placeholder": "", "category": "BLOCK", "start": 2, "end": 9,
+    {"fragment_id": 4, "decision_rank": 4, "blocked_by_fragment_id": 1,
+     "placeholder": "", "category": "BLOCK", "start": 2, "end": 9,
      "priority": 0, "kept": false, "drop_reason": "overlaps_higher_priority",
      "source": "manual", "rule_id": null}
   ],
@@ -151,7 +158,9 @@ python -m pytest -q
 
 ### 4. 查询脱敏结果 `GET /documents/{document_id}`
 
-返回脱敏文本与全部片段明细（含被丢弃片段及原因、`source` / `rule_id` 标注）。
+返回脱敏文本与全部片段明细（含被丢弃片段及原因、`source` / `rule_id` 标注、
+`fragment_id` / `decision_rank` / `blocked_by_fragment_id` 溯源字段，按
+`fragment_id` 排序）。
 不返回任何原文信息，不需要令牌。文档过期后返回 `410 Gone`，不存在返回 `404`。
 
 ### 5. 一次性令牌恢复 `POST /restore`
@@ -205,6 +214,40 @@ python -m pytest -q
 
 排序后依次落位：与**任何已占用区间相交**的片段被丢弃，
 `drop_reason = "overlaps_higher_priority"`（同优先级被先到者占用也使用此标记）。
+
+### 片段冲突溯源字段
+
+每次提交为**人工与自动候选合并后的全部片段**分配三个溯源字段，提交响应
+（`POST /documents`）与文档查询（`GET /documents/{id}`）均返回，且落库后不再漂移：
+
+- `fragment_id`：响应内唯一编号（从 1 起），按**合并后的原始顺序**分配——
+  人工片段按 `spans` 顺序编号，自动候选（规则按策略顺序扫描、按出现位置命中）
+  接在其后。**完全重复的候选也各有独立 `fragment_id`**；
+- `decision_rank`：按上面的优先级键排序后、依次落位决策的次序（从 1 起）。
+  它可能与 `fragment_id` 不同（后提交的高优先级片段先决策）；
+- `blocked_by_fragment_id`：保留片段恒为 `null`；丢弃片段指向**当时已经落位
+  且与之相交的第一个片段**的 `fragment_id`——即沿决策先后（`decision_rank`
+  从小到大）遇到的首个相交者，也就是实际导致该候选被拒绝的那一个，而不是
+  事后从所有相交项中任取。若丢弃片段同时跨越多个已保留区间，取其中决策最早者。
+  既有 `drop_reason` 语义保持不变。
+
+示例：一个候选同时跨越两个已保留区间——
+
+```jsonc
+// text = "0123456789ABCDEF"
+spans: [
+  {"start": 0, "end": 8, "priority": 1, "category": "C"},  // fragment_id 1
+  {"start": 2, "end": 4, "priority": 9, "category": "A"},  // fragment_id 2，decision_rank 1（先落位）
+  {"start": 6, "end": 8, "priority": 9, "category": "B"}   // fragment_id 3，decision_rank 2（随后落位）
+]
+// fragment_id 1 的大区间与 2、3 都相交，最后决策（decision_rank 3）时被拒；
+// blocked_by_fragment_id = 2 —— 取决策最早的相交者，而非 start 更小或任意一个。
+// 渲染结果：01{{A:01}}45{{B:01}}89ABCDEF
+```
+
+跨来源时同理：自动候选虽排在人工之后（`fragment_id` 更大），只要优先级更高就
+会先落位，被其拒绝的人工片段 `blocked_by_fragment_id` 指向该自动片段；同起止、
+同长度、同优先级时人工先落位，自动片段反向指向人工片段。
 
 占位符：
 
@@ -269,9 +312,9 @@ app/
   config.py             环境变量配置
   crypto.py             Fernet 加密封装、一次性令牌生成
   db.py                 SQLite 建表（幂等，含旧库迁移）与连接
-  redaction.py          重叠消解 / 稳定占位符 / 渲染（纯函数，易测）
+  redaction.py          重叠消解 / 稳定占位符 / 渲染 / 冲突溯源（纯函数，易测）
   policy_engine.py      规则编译、空匹配拒绝、单规则超时（独立工作进程）
-  schemas.py            请求与响应模型（含策略、片段来源标注）
+  schemas.py            请求与响应模型（含策略、片段来源标注、冲突溯源字段）
   services/
     document_service.py 提交、查询、恢复、过期清理业务逻辑
     policy_service.py   自动脱敏策略创建 / 查询（不可变）
