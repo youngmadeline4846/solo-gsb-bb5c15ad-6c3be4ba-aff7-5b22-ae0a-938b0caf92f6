@@ -134,3 +134,151 @@ def test_auto_span_labels_preserved_through_placeholder_assignment():
     result = redact(text, [_span(0, 2, 0, "PERSON", 0, source=AUTO, rule_id="p")])
     assert result.redacted_text == "{{PERSON:01}}张三"
     assert result.spans[0].source == AUTO and result.spans[0].rule_id == "p"
+
+
+# ---------- 片段冲突溯源：fragment_id / decision_rank / blocked_by ----------
+
+
+def test_fragment_ids_follow_merged_original_order():
+    # ordinal：人工 0、1，自动 2、3 追加其后；ID 只认原始顺序，与决策先后无关
+    text = "abcdef"
+    result = redact(
+        text,
+        [
+            _span(0, 1, 0, "A", 0),
+            _span(1, 2, 0, "A", 1),
+            _span(2, 3, 5, "A", 2, source=AUTO, rule_id="r1"),
+            _span(3, 4, 5, "A", 3, source=AUTO, rule_id="r1"),
+        ],
+    )
+    assert [s.fragment_id for s in result.spans] == [
+        "frag-0001",
+        "frag-0002",
+        "frag-0003",
+        "frag-0004",
+    ]
+    # 高优先级自动片段先落位（rank 1、2），但 ID 仍是其原始顺序号
+    by_id = {s.fragment_id: s for s in result.spans}
+    assert by_id["frag-0003"].decision_rank == 1
+    assert by_id["frag-0004"].decision_rank == 2
+    assert {s.decision_rank for s in result.spans} == {1, 2, 3, 4}
+    assert all(s.kept and s.blocked_by_fragment_id is None for s in result.spans)
+
+
+def test_exact_duplicate_candidates_get_distinct_ids():
+    text = "abcdef"
+    result = redact(
+        text,
+        [
+            _span(0, 3, 0, "DUP", 0),
+            _span(0, 3, 0, "DUP", 1),  # 起止、优先级、类别、原文完全相同
+        ],
+    )
+    ids = [s.fragment_id for s in result.spans]
+    assert ids == ["frag-0001", "frag-0002"]
+    kept, dropped = result.spans
+    assert kept.kept and kept.blocked_by_fragment_id is None
+    assert not dropped.kept
+    assert dropped.blocked_by_fragment_id == "frag-0001"
+    assert dropped.decision_rank == 2
+    assert dropped.drop_reason == "overlaps_higher_priority"
+
+
+def test_equal_priority_blocked_by_first_placed():
+    text = "abcdef"
+    result = redact(
+        text,
+        [
+            _span(0, 3, 0, "A", 0),
+            _span(2, 5, 0, "B", 1),
+        ],
+    )
+    first, second = result.spans
+    assert first.kept and first.decision_rank == 1
+    assert not second.kept and second.decision_rank == 2
+    assert second.blocked_by_fragment_id == first.fragment_id
+
+
+def test_blocker_is_decision_earliest_not_earliest_start():
+    # 低优先级大跨度同时压过两个已保留区间：
+    # 决策最先的是高优先级但 start 更靠后的片段，阻断者必须指向它
+    text = "0123456789"
+    result = redact(
+        text,
+        [
+            _span(0, 5, 8, "EARLY_START", 0),   # rank 2
+            _span(8, 10, 9, "LATE_START", 1),   # rank 1（优先级最高）
+            _span(0, 10, 1, "BIG", 2),          # 与两者都相交
+        ],
+    )
+    by_id = {s.fragment_id: s for s in result.spans}
+    late = next(s for s in result.spans if s.category == "LATE_START")
+    early = next(s for s in result.spans if s.category == "EARLY_START")
+    big = next(s for s in result.spans if s.category == "BIG")
+    assert late.decision_rank == 1 and early.decision_rank == 2
+    assert not big.kept
+    assert big.blocked_by_fragment_id == late.fragment_id
+
+
+def test_dropped_span_does_not_block_later_candidate():
+    # 中优先级大跨度先被高优先级片段拒绝；更低优先级的同位置候选也只能被
+    # 已落位的高优先级片段阻断，而不是那个先判定却被丢弃的片段
+    text = "0123456789"
+    result = redact(
+        text,
+        [
+            _span(2, 3, 9, "TOP", 0),    # rank 1 保留
+            _span(0, 5, 5, "MID", 1),    # rank 2 丢弃
+            _span(0, 5, 1, "LOW", 2),    # rank 3 丢弃
+        ],
+    )
+    top, mid, low = result.spans
+    assert top.kept
+    assert not mid.kept and mid.blocked_by_fragment_id == top.fragment_id
+    assert not low.kept and low.blocked_by_fragment_id == top.fragment_id
+
+
+def test_candidate_spanning_multiple_kept_intervals():
+    text = "0123456789"
+    result = redact(
+        text,
+        [
+            _span(0, 2, 5, "A", 0),    # rank 1 保留
+            _span(5, 7, 5, "B", 1),    # rank 2 保留
+            _span(0, 10, 0, "BIG", 2), # rank 3，跨越两个保留区间
+        ],
+    )
+    a, b, big = result.spans
+    assert a.kept and b.kept
+    assert not big.kept
+    # 两个已落位片段都相交，按决策先后取 rank 最小者
+    assert big.blocked_by_fragment_id == a.fragment_id
+
+
+def test_blocked_by_across_sources():
+    # 同优先级同位置：人工先落位（决胜规则），自动片段被人工阻断
+    text = "abcdef"
+    result = redact(
+        text,
+        [
+            _span(0, 3, 5, "MANUAL_TAG", 0),
+            _span(0, 3, 5, "AUTO_TAG", 1, source=AUTO, rule_id="r"),
+        ],
+    )
+    manual, auto = result.spans
+    assert manual.kept
+    assert not auto.kept
+    assert auto.blocked_by_fragment_id == manual.fragment_id
+
+    # 自动优先级更高时，人工片段被自动片段阻断
+    result2 = redact(
+        text,
+        [
+            _span(0, 3, 5, "MANUAL_TAG", 0),
+            _span(0, 3, 9, "AUTO_TAG", 1, source=AUTO, rule_id="r"),
+        ],
+    )
+    manual2, auto2 = result2.spans
+    assert auto2.kept
+    assert not manual2.kept
+    assert manual2.blocked_by_fragment_id == auto2.fragment_id

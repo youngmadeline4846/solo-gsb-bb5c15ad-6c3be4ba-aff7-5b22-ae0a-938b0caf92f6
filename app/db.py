@@ -39,6 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_policy_rules_policy ON policy_rules(policy_id);
 CREATE TABLE IF NOT EXISTS fragments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id   TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    fragment_id   TEXT NOT NULL,             -- 响应内唯一 ID（frag-0001 …），按合并后原始顺序
+    decision_rank INTEGER NOT NULL,          -- 优先级排序后的落位判定序号（从 1 起）
+    blocked_by_fragment_id TEXT,             -- 丢弃片段的实际阻断者；保留片段为 NULL
     placeholder   TEXT NOT NULL,
     category      TEXT NOT NULL,
     start_offset  INTEGER NOT NULL,
@@ -77,6 +80,20 @@ _MIGRATIONS = (
     " ON fragments(document_id, placeholder, start_offset) WHERE kept = 1",
 )
 
+# 片段冲突溯源字段（引入 fragment_id / decision_rank / blocked_by_fragment_id）
+_TRACE_MIGRATIONS = (
+    "ALTER TABLE fragments ADD COLUMN fragment_id TEXT",
+    "ALTER TABLE fragments ADD COLUMN decision_rank INTEGER",
+    "ALTER TABLE fragments ADD COLUMN blocked_by_fragment_id TEXT",
+)
+
+# 溯源列建好后（或新库本就有）才能创建该唯一索引；单独放在迁移末尾，
+# 避免 SCHEMA 先于旧库的 ALTER 执行时引用不存在的列
+_POST_MIGRATION_STMTS = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_fragments_fragment_id"
+    " ON fragments(document_id, fragment_id)",
+)
+
 
 async def init_db(db_path: str = ":memory:") -> None:
     """幂等建表 / 迁移（容器启动与 CLI 共用）。
@@ -86,6 +103,8 @@ async def init_db(db_path: str = ":memory:") -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(SCHEMA)
         await _migrate(db)
+        for stmt in _POST_MIGRATION_STMTS:
+            await db.execute(stmt)
         await db.commit()
 
 
@@ -95,6 +114,8 @@ def init_db_sync(db_path: str) -> None:
     try:
         conn.executescript(SCHEMA)
         _migrate_sync(conn)
+        for stmt in _POST_MIGRATION_STMTS:
+            conn.execute(stmt)
         conn.commit()
     finally:
         conn.close()
@@ -108,12 +129,18 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "rule_id" not in existing:
         for stmt in _MIGRATIONS:
             await db.execute(stmt)
+    if "fragment_id" not in existing:
+        for stmt in _TRACE_MIGRATIONS:
+            await db.execute(stmt)
 
 
 def _migrate_sync(conn: sqlite3.Connection) -> None:
     existing = {r[1] for r in conn.execute("PRAGMA table_info(fragments)")}
     if "rule_id" not in existing:
         for stmt in _MIGRATIONS:
+            conn.execute(stmt)
+    if "fragment_id" not in existing:
+        for stmt in _TRACE_MIGRATIONS:
             conn.execute(stmt)
 
 

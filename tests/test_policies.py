@@ -161,7 +161,23 @@ async def test_manual_wins_when_priority_offsets_length_equal(client):
     assert len(dropped) == 1 and dropped[0]["source"] == "auto"
     assert dropped[0]["rule_id"] == "p"
     assert dropped[0]["drop_reason"] == "overlaps_higher_priority"
+    assert dropped[0]["blocked_by_fragment_id"] == kept[0]["fragment_id"]
     assert "{{MANUAL_TAG:01}}" in data["redacted_text"]
+
+    # 查询接口溯源字段不漂移，且人工片段排在自动片段之前（合并后原始顺序）
+    q = await client.get(f"/documents/{data['document_id']}")
+    assert q.status_code == 200
+    qfrags = q.json()["fragments"]
+    assert (qfrags[0]["source"], qfrags[0]["fragment_id"]) == (
+        "manual",
+        "frag-0001",
+    )
+    assert {f["fragment_id"] for f in qfrags} == {
+        f["fragment_id"] for f in data["fragments"]
+    }
+    q_dropped = next(f for f in qfrags if not f["kept"])
+    assert q_dropped["blocked_by_fragment_id"] == kept[0]["fragment_id"]
+    assert q_dropped["decision_rank"] == dropped[0]["decision_rank"]
 
 
 async def test_higher_priority_auto_beats_manual(client):
@@ -180,6 +196,10 @@ async def test_higher_priority_auto_beats_manual(client):
     frags = [f for f in data["fragments"] if f["start"] == 2 and f["end"] == 4]
     kept = [f for f in frags if f["kept"]][0]
     assert kept["source"] == "auto" and kept["category"] == "AUTO_TAG"
+    dropped = [f for f in frags if not f["kept"]][0]
+    # 跨来源反向情形：人工片段被高优先级自动片段阻断
+    assert dropped["source"] == "manual"
+    assert dropped["blocked_by_fragment_id"] == kept["fragment_id"]
     assert "{{AUTO_TAG:01}}" in data["redacted_text"]
 
 

@@ -2,7 +2,9 @@
 
 提交合同原文及一批带 **起止位置、优先级、类别** 的敏感片段，服务端：
 
-1. 按 **原始 Unicode 码位位置** 一次性解析全部片段，确定性消解重叠；
+1. 按 **原始 Unicode 码位位置** 一次性解析全部片段，确定性消解重叠；每个片段
+   获得响应内唯一的 `fragment_id`，丢弃片段以 `blocked_by_fragment_id` 溯源到
+   实际造成拒绝的首个已落位片段；
 2. 生成 **稳定占位符**（同文档内相同「类别 + 原文」复用同一占位符）；
 3. 原文与片段映射经 **Fernet 对称加密** 后存入 SQLite，且 **可过期**（定时 + 懒清理）；
 4. 恢复接口仅认 **一次性令牌**：用后作废并轮换，只能还原请求中显式指定的占位符。
@@ -98,7 +100,11 @@ python -m pytest -q
 - 自动片段同样使用 Unicode 码位偏移，与人工片段统一进入下面的确定性重叠排序；
 - 当 **优先级、起止位置、长度完全相同** 时，**人工片段优先**于自动片段；
 - 响应中每个片段带 `source`（`"manual"` 手传 / `"auto"` 规则生成）与 `rule_id`
-  （仅 `auto` 片段标注来源规则）。
+  （仅 `auto` 片段标注来源规则）；
+- 每个片段带响应内唯一的 `fragment_id`（`"frag-0001"` 起步）与 `decision_rank`
+  （优先级排序后实际判定的先后序号，从 1 起）；丢弃片段的
+  `blocked_by_fragment_id` 指向**当时已落位且实际导致拒绝**的首个片段，
+  保留片段为 `null`。详见[第四章](#四重叠消解与占位符规则)。
 
 响应（节选）：
 
@@ -107,13 +113,17 @@ python -m pytest -q
   "document_id": "0b0b3e4b…",
   "redacted_text": "甲方{{PERSON:01}}向乙方{{PERSON:02}}借款{{MONEY:01}}。",
   "fragments": [
-    {"placeholder": "{{PERSON:01}}", "category": "PERSON", "start": 2, "end": 4,
+    {"fragment_id": "frag-0001", "decision_rank": 1, "blocked_by_fragment_id": null,
+     "placeholder": "{{PERSON:01}}", "category": "PERSON", "start": 2, "end": 4,
      "priority": 5, "kept": true,  "drop_reason": null, "source": "manual", "rule_id": null},
-    {"placeholder": "{{PERSON:02}}", "category": "PERSON", "start": 7, "end": 9,
+    {"fragment_id": "frag-0002", "decision_rank": 2, "blocked_by_fragment_id": null,
+     "placeholder": "{{PERSON:02}}", "category": "PERSON", "start": 7, "end": 9,
      "priority": 5, "kept": true,  "drop_reason": null, "source": "auto", "rule_id": "person-name"},
-    {"placeholder": "{{MONEY:01}}",  "category": "MONEY",  "start": 11, "end": 20,
+    {"fragment_id": "frag-0003", "decision_rank": 3, "blocked_by_fragment_id": null,
+     "placeholder": "{{MONEY:01}}",  "category": "MONEY",  "start": 11, "end": 20,
      "priority": 3, "kept": true,  "drop_reason": null, "source": "auto", "rule_id": "money"},
-    {"placeholder": "", "category": "BLOCK", "start": 2, "end": 9,
+    {"fragment_id": "frag-0004", "decision_rank": 4, "blocked_by_fragment_id": "frag-0001",
+     "placeholder": "", "category": "BLOCK", "start": 2, "end": 9,
      "priority": 0, "kept": false, "drop_reason": "overlaps_higher_priority",
      "source": "manual", "rule_id": null}
   ],
@@ -122,6 +132,9 @@ python -m pytest -q
   "token_expires_at": "2026-09-21T11:10:00.000000Z"
 }
 ```
+
+> 上例中 `BLOCK` 同时与 `frag-0001`、`frag-0002` 相交，但阻断者是决策序号
+> 最小（最先落位）的 `frag-0001`，而不是按起点位置或事后任取一个相交项。
 
 ### 2. 创建自动脱敏策略 `POST /policies`
 
@@ -151,8 +164,11 @@ python -m pytest -q
 
 ### 4. 查询脱敏结果 `GET /documents/{document_id}`
 
-返回脱敏文本与全部片段明细（含被丢弃片段及原因、`source` / `rule_id` 标注）。
-不返回任何原文信息，不需要令牌。文档过期后返回 `410 Gone`，不存在返回 `404`。
+返回脱敏文本与全部片段明细（含被丢弃片段及原因、`source` / `rule_id` 标注、
+`fragment_id` / `decision_rank` / `blocked_by_fragment_id` 溯源字段）。片段按
+提交时人工与自动候选**合并后的原始顺序**返回，与提交响应完全一致；溯源字段
+随片段一并持久化，之后查询不会漂移。不返回任何原文信息，不需要令牌。
+文档过期后返回 `410 Gone`，不存在返回 `404`。
 
 ### 5. 一次性令牌恢复 `POST /restore`
 
@@ -195,6 +211,19 @@ python -m pytest -q
 
 ## 四、重叠消解与占位符规则
 
+**片段标识与冲突溯源**（提交响应与文档查询均返回，持久化后不变）：
+
+- `fragment_id`：每次提交内唯一，形如 `frag-0001`（序号起步 4 位，超过 9999
+  自动加宽）。按**人工与自动候选合并后的原始顺序**分配：人工片段按 `spans`
+  提交顺序编号，自动片段（规则顺序 × 命中顺序）接在其后。即使两个候选
+  起止、优先级、类别、原文完全重复，也是各自独立的片段，拥有不同 ID；
+- `decision_rank`：片段在下列优先级排序中实际被判定的先后序号，从 `1` 起、
+  到片段总数为止（与返回列表顺序相互独立）；
+- `blocked_by_fragment_id`：保留片段恒为 `null`。丢弃片段指向**做出拒绝判定的
+  那一刻已经落位**、且与之实际相交的片段中 `decision_rank` 最小（决策最先）
+  的那一个——即真正导致它被拒绝的首个片段，而不是事后从所有相交项中任取。
+  被丢弃的片段不占区间，永远不会成为后来者的阻断者。
+
 排序键（全部确定，无随机）：
 
 1. `priority` **数值大者优先**；
@@ -204,7 +233,17 @@ python -m pytest -q
 5. 仍相同：按提交顺序（人工片段按 `spans` 顺序，自动片段接在其后，先到先得）。
 
 排序后依次落位：与**任何已占用区间相交**的片段被丢弃，
-`drop_reason = "overlaps_higher_priority"`（同优先级被先到者占用也使用此标记）。
+`drop_reason = "overlaps_higher_priority"`（同优先级被先到者占用也使用此标记；
+该字段语义不因溯源字段而改变）。
+
+示例（一个候选同时跨越多个已保留区间）：
+
+```
+区间：  [0,2) 优先级5 → 落位（frag-0001, rank 1）
+        [5,7) 优先级5 → 落位（frag-0002, rank 2）
+        [0,10) 优先级0 → 与 frag-0001、frag-0002 都相交，被拒；
+                         blocked_by_fragment_id = "frag-0001"（rank 最小）
+```
 
 占位符：
 
@@ -269,9 +308,9 @@ app/
   config.py             环境变量配置
   crypto.py             Fernet 加密封装、一次性令牌生成
   db.py                 SQLite 建表（幂等，含旧库迁移）与连接
-  redaction.py          重叠消解 / 稳定占位符 / 渲染（纯函数，易测）
+  redaction.py          重叠消解 / 片段溯源 ID / 稳定占位符 / 渲染（纯函数，易测）
   policy_engine.py      规则编译、空匹配拒绝、单规则超时（独立工作进程）
-  schemas.py            请求与响应模型（含策略、片段来源标注）
+  schemas.py            请求与响应模型（含策略、片段来源与冲突溯源标注）
   services/
     document_service.py 提交、查询、恢复、过期清理业务逻辑
     policy_service.py   自动脱敏策略创建 / 查询（不可变）

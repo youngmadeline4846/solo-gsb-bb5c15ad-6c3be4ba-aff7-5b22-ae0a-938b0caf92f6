@@ -152,3 +152,55 @@ async def test_health(client):
     resp = await client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+async def test_fragment_traceability_fields_and_persistence(client):
+    resp = await client.post("/documents", json=_payload())
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    fragments = data["fragments"]
+
+    # fragment_id 按合并后原始顺序（本例全部人工，即 spans 顺序），响应内唯一
+    ids = [f["fragment_id"] for f in fragments]
+    assert ids == [f"frag-{i:04d}" for i in range(1, 5)]
+    assert len(set(ids)) == 4
+    # decision_rank 是优先级排序后的 1..N 全排列，与列表顺序不同
+    ranks = sorted(f["decision_rank"] for f in fragments)
+    assert ranks == [1, 2, 3, 4]
+
+    by_id = {f["fragment_id"]: f for f in fragments}
+    # 保留片段：blocked_by 为 null
+    kept = [f for f in fragments if f["kept"]]
+    assert all(f["blocked_by_fragment_id"] is None for f in kept)
+
+    # 低优先级大跨度 [3,33) 同时跨越三个已保留区间；
+    # 阻断者必须是决策最先（priority=5 的张三），而非 start 最小的 org
+    dropped = next(f for f in fragments if not f["kept"])
+    zhangsan = next(f for f in fragments if f["start"] == 18 and f["end"] == 20)
+    assert zhangsan["decision_rank"] == 1
+    assert dropped["blocked_by_fragment_id"] == zhangsan["fragment_id"]
+    # drop_reason 语义不变
+    assert dropped["drop_reason"] == "overlaps_higher_priority"
+    assert by_id[dropped["blocked_by_fragment_id"]]["kept"] is True
+
+    # 查询接口原样返回溯源字段，顺序与提交一致：持久化后不得漂移
+    q = await client.get(f"/documents/{data['document_id']}")
+    assert q.status_code == 200
+    qfrags = q.json()["fragments"]
+    assert qfrags == fragments
+
+
+async def test_exact_duplicates_have_distinct_fragment_ids(client):
+    body = {
+        "text": "abcdef",
+        "spans": [
+            {"start": 0, "end": 3, "priority": 0, "category": "DUP"},
+            {"start": 0, "end": 3, "priority": 0, "category": "DUP"},
+        ],
+    }
+    data = (await client.post("/documents", json=body)).json()
+    ids = [f["fragment_id"] for f in data["fragments"]]
+    assert ids == ["frag-0001", "frag-0002"]
+    kept, dropped = data["fragments"]
+    assert kept["kept"] and kept["blocked_by_fragment_id"] is None
+    assert dropped["blocked_by_fragment_id"] == "frag-0001"

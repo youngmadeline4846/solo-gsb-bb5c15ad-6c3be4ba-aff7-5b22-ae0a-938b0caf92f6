@@ -2,10 +2,17 @@
 
 规则（确定性、无随机成分）：
 * ``start`` / ``end`` 均为 Unicode 码位偏移，左闭右开，依据 Python 字符串索引；
-* 片段按 (优先级降序, start 升序, 长度降序, 人工优先, 提交顺序) 排序；
+* 人工与自动候选合并后的原始顺序（人工按 ``spans`` 顺序，自动片段按规则及
+  命中顺序追加其后）决定每个片段在响应内唯一的 ``fragment_id``（``"frag-0001"``
+  起步，序号超宽自动加宽）；
+* 片段按 (优先级降序, start 升序, 长度降序, 人工优先, 提交顺序) 排序，排序后的
+  落位先后记录为从 1 起的 ``decision_rank``；
 * 排序靠前的片段先落位，与之重叠的后续片段被丢弃，``drop_reason`` 标为
-  ``"overlaps_higher_priority"``（同优先级先到先得）；
-* 同一文档内 (类别, 原文) 相同的片段复用同一占位符，序号按首次出现顺序分配。
+  ``"overlaps_higher_priority"``（同优先级先到先得）；丢弃片段的
+  ``blocked_by_fragment_id`` 指向**当时已落位**且实际造成拒绝的相交片段中
+  决策序号（``decision_rank``）最小者，保留片段该字段为 ``None``；
+* 同一文档内 (类别, 原文) 相同的片段复用同一占位符，序号按首次出现顺序分配；
+  完全重复的候选也是独立片段，拥有各自不同的 ``fragment_id``。
 
 ``source`` 区分片段来源：``"manual"`` 为客户端手传片段，``"auto"`` 为策略规则
 在原文上自动命中的片段；自动片段通过 ``rule_id`` 标注来源规则。优先级、起止
@@ -47,6 +54,11 @@ class ResolvedSpan:
     value: str
     placeholder: str
     kept: bool
+    fragment_id: str = ""
+    # 排序落位的决策序号（从 1 起）：第几个被判定，而不是原始顺序
+    decision_rank: int = 0
+    # 丢弃时指向实际造成拒绝的已落位片段；保留片段为 None
+    blocked_by_fragment_id: str | None = None
     drop_reason: str | None = None
     source: str = MANUAL
     rule_id: str | None = None
@@ -69,8 +81,23 @@ def validate_category(category: str) -> None:
         )
 
 
+def make_fragment_ids(inputs: list[InputSpan]) -> dict[int, str]:
+    """按人工与自动候选合并后的原始顺序（ordinal）分配响应内唯一 ID。
+
+    形如 ``"frag-0001"``，序号起步 4 位，片段数更多时自动加宽。完全重复的
+    候选 ordinal 不同，因此也会得到各自不同的 ID。
+    """
+    width = max(4, len(str(len(inputs))))
+    return {
+        s.ordinal: "frag-" + f"{i + 1:0{width}d}"
+        for i, s in enumerate(sorted(inputs, key=lambda s: s.ordinal))
+    }
+
+
 def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
     """校验、排序并一次性消解全部片段重叠。"""
+    fragment_ids = make_fragment_ids(inputs)
+
     ordered = sorted(
         inputs,
         key=lambda s: (
@@ -82,12 +109,21 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
         ),
     )
 
-    occupied: list[tuple[int, int]] = []
+    # 已落位（保留）区间：(start, end, decision_rank, fragment_id)
+    placed: list[tuple[int, int, int, str]] = []
     resolved: dict[int, ResolvedSpan] = {}
 
-    for span in ordered:
+    for rank, span in enumerate(ordered, start=1):
         value = text[span.start:span.end]
-        if any(span.start < e and s < span.end for s, e in occupied):
+        # 实际相交的已落位片段中，按决策先后（decision_rank 最小）取阻断者；
+        # 已落位即保留片段，丢弃片段从不进入 placed，不能阻断后来者。
+        blockers = [
+            (prank, pid)
+            for s, e, prank, pid in placed
+            if span.start < e and s < span.end
+        ]
+        if blockers:
+            _, blocked_by = min(blockers, key=lambda b: b[0])
             resolved[span.ordinal] = ResolvedSpan(
                 start=span.start,
                 end=span.end,
@@ -96,13 +132,15 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
                 value=value,
                 placeholder="",
                 kept=False,
+                fragment_id=fragment_ids[span.ordinal],
+                decision_rank=rank,
+                blocked_by_fragment_id=blocked_by,
                 drop_reason="overlaps_higher_priority",
                 source=span.source,
                 rule_id=span.rule_id,
             )
             continue
-        occupied.append((span.start, span.end))
-        occupied.sort()
+        placed.append((span.start, span.end, rank, fragment_ids[span.ordinal]))
         resolved[span.ordinal] = ResolvedSpan(
             start=span.start,
             end=span.end,
@@ -111,6 +149,9 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
             value=value,
             placeholder="",
             kept=True,
+            fragment_id=fragment_ids[span.ordinal],
+            decision_rank=rank,
+            blocked_by_fragment_id=None,
             source=span.source,
             rule_id=span.rule_id,
         )
